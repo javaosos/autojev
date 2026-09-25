@@ -42,10 +42,23 @@ class Service:
     name: str = DEFAULT_MODEL
     checkpoint: str = "checkpoints/selected"
     release_date: str = ""
+    quantization: str | None = None
     lock: LockType = field(default_factory=threading.Lock)
 
 
 service = Service()
+
+
+def configured_quantization() -> str | None:
+    """Read AUTOJEV_QUANT; unset or 'none' keeps the released full-precision path."""
+    from autojev.model import QUANTIZATIONS
+
+    value = os.getenv("AUTOJEV_QUANT", "").strip().lower()
+    if not value or value == "none":
+        return None
+    if value not in QUANTIZATIONS:
+        raise ValueError(f"AUTOJEV_QUANT must be one of {('none', *QUANTIZATIONS)}.")
+    return value
 
 
 class Question(BaseModel):
@@ -119,7 +132,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from autojev.model import DecisionModel
 
     service.checkpoint = os.getenv("AUTOJEV_CHECKPOINT", "checkpoints/selected")
-    service.model = await run_in_threadpool(DecisionModel, checkpoint=service.checkpoint)
+    service.model = await run_in_threadpool(DecisionModel, checkpoint=service.checkpoint,
+                                             quant=configured_quantization())
+    service.quantization = service.model.quantization
     service.name = f"autojev-{service.model.base_model.rsplit('/', 1)[-1].lower()}"
     modified = (Path(service.checkpoint) / "decision_config.json").stat().st_mtime
     service.release_date = datetime.fromtimestamp(modified, timezone.utc).date().isoformat()
@@ -159,7 +174,7 @@ def playground() -> str:
 def health() -> dict[str, JSONValue]:
     return {"status": "ready" if service.model is not None else "loading", "model": service.name,
             "checkpoint": service.checkpoint, "authentication": bool(os.getenv("AUTOJEV_API_KEY")),
-            "modalities": ["text", "image"]}
+            "quantization": service.quantization, "modalities": ["text", "image"]}
 
 
 @app.get("/v1/models", dependencies=[Depends(authenticate)], response_model=None)

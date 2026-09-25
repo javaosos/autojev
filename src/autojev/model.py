@@ -14,7 +14,7 @@ from typing import TypedDict, cast
 import torch
 from PIL import Image
 from safetensors.torch import load_file, save_file
-from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
 from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
@@ -24,6 +24,7 @@ from autojev.types import Answer, Content, DecisionInput, ImageInput, JSONValue,
 BASE_MODEL = "Qwen/Qwen3.8-27B"
 BASE_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 MAX_OPTIONS = 255
+QUANTIZATIONS = ("4bit", "8bit")
 
 
 class CheckpointConfig(TypedDict):
@@ -110,10 +111,18 @@ def open_image(value: ImageInput) -> Image.Image:
         return image.convert("RGB")
 
 
+def quantization_config(quant: str) -> BitsAndBytesConfig:
+    """Runtime bitsandbytes quantization; the checkpoint on disk stays in full precision."""
+    if quant == "4bit":
+        return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                  bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
+    return BitsAndBytesConfig(load_in_8bit=True)
+
+
 class DecisionModel(torch.nn.Module):
     def __init__(
         self, checkpoint: str | Path | None = None, train: bool = False, device: str | None = None,
-        *, base_model: str = BASE_MODEL, revision: str = BASE_REVISION,
+        *, base_model: str = BASE_MODEL, revision: str = BASE_REVISION, quant: str | None = None,
         gradient_checkpointing: bool = False, cpu_threads: int = 8,
         cache_dir: str | Path | None = None,
     ) -> None:
@@ -121,6 +130,15 @@ class DecisionModel(torch.nn.Module):
         torch.set_num_threads(cpu_threads)
         torch.backends.cuda.enable_cudnn_sdp(False)
         self.device_name = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if quant not in (None, *QUANTIZATIONS):
+            raise ValueError(f"Quantization must be one of {QUANTIZATIONS}.")
+        if quant is not None and checkpoint is None:
+            raise ValueError("Quantized loading requires a decision checkpoint; the base model path stays in full precision.")
+        if quant is not None and train:
+            raise ValueError("Quantized weights cannot be trained; run full-weight SFT without quantization.")
+        if quant is not None and not self.device_name.startswith("cuda"):
+            raise ValueError("bitsandbytes 4-bit and 8-bit loading requires a CUDA device.")
+        self.quantization = quant
         saved: CheckpointConfig | None = None
         if checkpoint is not None:
             saved = cast(CheckpointConfig, json.loads((Path(checkpoint) / "decision_config.json").read_text()))
@@ -164,14 +182,29 @@ class DecisionModel(torch.nn.Module):
             self.backbone = original.model
             del original
         else:
-            self.backbone = Qwen3_5Model.from_pretrained(str(checkpoint), dtype=dtype, attn_implementation="sdpa")
+            if quant is None:
+                self.backbone = Qwen3_5Model.from_pretrained(str(checkpoint), dtype=dtype, attn_implementation="sdpa")
+            else:
+                self.backbone = Qwen3_5Model.from_pretrained(
+                    str(checkpoint), attn_implementation="sdpa",
+                    quantization_config=quantization_config(quant), device_map={"": self.device_name},
+                )
             config = cast(Qwen3_5TextConfig, self.backbone.config.text_config)
             self.readout = torch.nn.Linear(config.hidden_size, MAX_OPTIONS, bias=False, dtype=dtype)
             self.readout.load_state_dict(load_file(str(Path(checkpoint) / "readout.safetensors")))
-        self.requires_grad_(train)
+        if quant is None:
+            self.requires_grad_(train)
+        else:
+            # Quantized weights are frozen by construction; only the readout carries a dtype
+            # that supports gradients.
+            self.readout.requires_grad_(train)
         if train and gradient_checkpointing:
             self.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        self.to(self.device_name)
+        if quant is None:
+            self.to(self.device_name)
+        else:
+            # bitsandbytes places quantized weights through device_map and rejects Module.to.
+            self.readout.to(self.device_name)
         self.temperature = saved["temperature"] if saved else 1.0
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("Temperature must be positive and finite.")
@@ -225,6 +258,8 @@ class DecisionModel(torch.nn.Module):
 
     def save(self, directory: str | Path, temperature: float | None = None, **metadata: JSONValue) -> None:
         """Write a new artifact directory; the caller atomically publishes its pointer."""
+        if self.quantization is not None:
+            raise ValueError("Quantized weights are a runtime view; save an unquantized model instead.")
         destination = Path(directory)
         if destination.exists() and any(destination.iterdir()):
             raise FileExistsError(f"Refusing to overwrite checkpoint contents: {destination}")

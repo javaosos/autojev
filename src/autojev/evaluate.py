@@ -435,6 +435,7 @@ class Arguments(argparse.Namespace):
     batch_size: int
     temperature: float | None
     model: str
+    quant: str | None
     resume: bool
 
 
@@ -450,14 +451,16 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--temperature", type=float, help="Override the checkpoint temperature; use 1 for raw results")
     parser.add_argument("--model", default="typesafe/jev-1.13")
+    parser.add_argument("--quant", choices=("4bit", "8bit"),
+                        help="Load a local checkpoint with bitsandbytes; requires a CUDA device and is not the released precision")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(namespace=Arguments())
     if sum((args.jev, args.local, args.predictions is not None)) != 1:
         parser.error("Choose exactly one of --jev, --local or --predictions")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
-    if not args.local and (args.checkpoint is not None or args.temperature is not None):
-        parser.error("--checkpoint and --temperature require --local")
+    if not args.local and (args.checkpoint is not None or args.temperature is not None or args.quant is not None):
+        parser.error("--checkpoint, --temperature and --quant require --local")
     if args.resume and not args.jev:
         parser.error("--resume applies to interrupted remote evaluations")
     rows = read_rows(args.data)
@@ -473,7 +476,7 @@ def main() -> None:
         destination = args.output.with_suffix(".predictions.jsonl")
         if destination.exists():
             raise FileExistsError(f"Refusing to overwrite an evaluation: {destination}")
-        model = DecisionModel(checkpoint=args.checkpoint)
+        model = DecisionModel(checkpoint=args.checkpoint, quant=args.quant)
         scale = model.temperature if args.temperature is None else args.temperature
 
         @torch.inference_mode()
@@ -487,6 +490,7 @@ def main() -> None:
 
         predictions = predict_local(rows, infer, scale)
         identity.update({"model": model.base_model, "revision": model.revision, "temperature": scale,
+                         "quantization": model.quantization,
                          "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint else None, "endpoint": "local"})
         if args.checkpoint is not None:
             identity["checkpoint_config_sha256"] = hashlib.sha256((args.checkpoint / "decision_config.json").read_bytes()).hexdigest()

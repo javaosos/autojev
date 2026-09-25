@@ -22,6 +22,7 @@ dependencies = [
   "numpy==2.5.3",
   "huggingface-hub==1.31.0",
   "imageio-ffmpeg>=0.6",
+  "bitsandbytes==0.50.2",
 ]
 
 [project.scripts]
@@ -48,3 +49,6 @@ untyped_calls_exclude = ["transformers", "datasets", "torch._tensor.Tensor.backw
 [[tool.mypy.overrides]]
 module = ["datasets.*"]
 ignore_missing_imports = true
+
+[tool.uv]
+exclude-newer = "P7D"
